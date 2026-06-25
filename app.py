@@ -1,8 +1,7 @@
 import streamlit as st
 import sqlite3, json, re, os, tempfile, pandas as pd
-import google.generativeai as genai
+from groq import Groq
 
-# ── Page config ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="FMCG AI Assistant", page_icon="🥤", layout="centered")
 
 st.markdown("""
@@ -19,17 +18,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ──────────────────────────────────────────────────────────────
 st.markdown('<p class="main-title">🥤 FMCG AI Assistant</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-title">Ask any business question about beverages sales, inventory & promotions.</p>', unsafe_allow_html=True)
 
-# ── Sidebar ─────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
     api_key = st.text_input(
-        "Google Gemini API Key", type="password",
-        value=st.secrets.get("GEMINI_API_KEY", ""),
-        help="Free key from aistudio.google.com"
+        "Groq API Key", type="password",
+        value=st.secrets.get("GROQ_API_KEY", ""),
+        help="Free key from console.groq.com"
     )
     st.markdown("---")
     st.markdown("**📌 Sample Questions**")
@@ -43,7 +40,6 @@ with st.sidebar:
     ]:
         st.markdown(f"• {q}")
 
-# ── Load DB (cached — runs once) ─────────────────────────────────────────
 @st.cache_resource
 def get_db():
     csv_path = os.path.join(os.path.dirname(__file__), "merged_data.csv")
@@ -51,60 +47,34 @@ def get_db():
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     conn = sqlite3.connect(tmp.name, check_same_thread=False)
     df.to_sql("fmcg_data", conn, if_exists="replace", index=False)
-    for col in ["product_id", "store_id", "week_start_date", "region", "promotion_flag"]:
+    for col in ["product_id","store_id","week_start_date","region","promotion_flag"]:
         conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{col} ON fmcg_data({col})")
     conn.commit()
     return conn
 
-# ── Schema for Gemini ────────────────────────────────────────────────────
-SCHEMA = """
-You are a SQL expert for an FMCG beverages analytics database (SQLite).
-There is ONE table called fmcg_data with these columns:
+SCHEMA = """You are a SQL expert for an FMCG beverages SQLite database.
+ONE table called fmcg_data with columns:
+  week_start_date TEXT, product_id TEXT, product_name TEXT, brand TEXT,
+  category TEXT (Juice/Water/Carbonated/Energy/Dairy),
+  pack_size_ml INTEGER, unit_price INTEGER,
+  store_id TEXT, store_name TEXT, region TEXT (North/South/East/West),
+  city TEXT, store_format TEXT (Hypermarket/Convenience/Supermarket/Wholesale),
+  opening_stock INTEGER, units_received INTEGER, units_sold INTEGER,
+  closing_stock INTEGER, stockout_flag BOOLEAN (1=stockout),
+  revenue REAL, promotion_flag BOOLEAN (1=promotion), promotion_type TEXT, discount_pct REAL
 
-  week_start_date TEXT    -- ISO date e.g. '2024-01-01'
-  product_id      TEXT    -- e.g. 'BEV001'
-  product_name    TEXT
-  brand           TEXT
-  category        TEXT    -- Juice, Water, Carbonated, Energy, Dairy
-  pack_size_ml    INTEGER
-  unit_price      INTEGER
-  store_id        TEXT
-  store_name      TEXT
-  region          TEXT    -- North, South, East, West
-  city            TEXT
-  store_format    TEXT    -- Hypermarket, Convenience, Supermarket, Wholesale
-  opening_stock   INTEGER
-  units_received  INTEGER
-  units_sold      INTEGER
-  closing_stock   INTEGER
-  stockout_flag   BOOLEAN -- 1 = stockout occurred
-  revenue         REAL
-  promotion_flag  BOOLEAN -- 1 = promotion running
-  promotion_type  TEXT    -- BOGO, Price Cut, Display Feature, Bundle, or NULL
-  discount_pct    REAL
-
-STRICT RULES:
-- Output ONLY a single SELECT statement inside a ```sql code block.
-- Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, PRAGMA.
-- For booleans: promotion_flag = 1 or stockout_flag = 1
+RULES:
+- Output ONLY a single SELECT inside a ```sql block. Nothing else.
+- Never use INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/PRAGMA.
+- Booleans: promotion_flag=1 or stockout_flag=1
 - Always alias aggregates: SUM(revenue) AS total_revenue
-- Add LIMIT when listing rows (max 100).
-- No explanation, no preamble — ONLY the ```sql block.
-"""
-
-SUMMARISE_PROMPT = """
-You are a concise FMCG business analyst.
-Summarise the SQL query results in 2-4 clear sentences with specific numbers.
-Never mention SQL, table names, or column names.
-Sound like a business report, not a technical document.
-"""
+- Add LIMIT (max 100) when listing rows."""
 
 def extract_sql(text):
-    m = re.search(r"```sql\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    m = re.search(r"```sql\s*(.*?)```", text, re.DOTALL|re.IGNORECASE)
     if m: return m.group(1).strip()
     m = re.search(r"```(.*?)```", text, re.DOTALL)
     if m: return m.group(1).strip()
-    # fallback — return as-is if it starts with SELECT
     if text.strip().lower().startswith("select"):
         return text.strip()
     return ""
@@ -117,46 +87,57 @@ def is_safe(sql):
     return True
 
 def run_question(question, api_key):
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    client = Groq(api_key=api_key)
     conn = get_db()
 
     # Step 1 — Generate SQL
-    sql_prompt = f"{SCHEMA}\n\nConvert this business question to a SQLite SELECT query:\n{question}"
-    sql_response = model.generate_content(sql_prompt)
-    sql = extract_sql(sql_response.text)
+    r = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": SCHEMA},
+            {"role": "user", "content": f"Convert to SQLite SELECT:\n{question}"}
+        ],
+        temperature=0,
+        max_tokens=300
+    )
+    sql = extract_sql(r.choices[0].message.content)
 
     if not sql:
-        return None, "", "Could not generate a SQL query for that question. Try rephrasing."
+        return None, "", "Could not generate SQL. Try rephrasing your question."
 
-    # Step 2 — Safety check
     if not is_safe(sql):
-        return None, sql, "Generated query was rejected for safety. Try a different question."
+        return None, sql, "Query rejected for safety. Try a different question."
 
-    # Step 3 — Run query
+    # Step 2 — Run query
     try:
         cur = conn.cursor()
         cur.execute(sql)
         cols = [d[0] for d in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchmany(200)]
     except Exception as e:
-        return None, sql, f"SQL error: {e}. Try rephrasing your question."
+        return None, sql, f"SQL error: {e}. Try rephrasing."
 
     if not rows:
-        return [], sql, "No data found for your question. Try adjusting filters like region, category, or date range."
+        return [], sql, "No data found. Try adjusting your filters."
 
-    # Step 4 — Summarise
-    summary_prompt = f"{SUMMARISE_PROMPT}\n\nQuestion: {question}\nResults: {json.dumps(rows[:30], default=str)}"
-    summary_response = model.generate_content(summary_prompt)
-    return rows, sql, summary_response.text
+    # Step 3 — Summarise
+    r2 = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are an FMCG business analyst. Summarise results in 2-4 clear sentences with specific numbers. Never mention SQL, tables, or column names."},
+            {"role": "user", "content": f"Question: {question}\nResults: {json.dumps(rows[:30], default=str)}\nGive a business summary."}
+        ],
+        max_tokens=300
+    )
+    return rows, sql, r2.choices[0].message.content
 
-# ── Session state ────────────────────────────────────────────────────────
+# Session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending" not in st.session_state:
     st.session_state.pending = ""
 
-# ── Suggestion chips ─────────────────────────────────────────────────────
+# Suggestion chips
 suggestions = [
     "Which region had highest revenue?",
     "Top 5 products by units sold?",
@@ -172,7 +153,7 @@ for i, s in enumerate(suggestions):
 
 st.markdown("---")
 
-# ── Chat history ─────────────────────────────────────────────────────────
+# Chat history
 for msg in st.session_state.messages:
     if msg["role"] == "user":
         st.markdown(f'<div class="user-msg">🧑‍💼 {msg["content"]}</div>', unsafe_allow_html=True)
@@ -185,7 +166,8 @@ for msg in st.session_state.messages:
             with st.expander(f"📊 View data ({len(msg['rows'])} rows)"):
                 st.dataframe(pd.DataFrame(msg["rows"]), use_container_width=True)
 
-# ── Input ────────────────────────────────────────────────────────────────
+# Input
+st.markdown("---")
 question = st.chat_input("Ask a question about your FMCG data...")
 active = st.session_state.pending or question
 if st.session_state.pending:
@@ -193,7 +175,7 @@ if st.session_state.pending:
 
 if active:
     if not api_key:
-        st.warning("⚠️ Enter your Gemini API key in the sidebar first. Get one free at aistudio.google.com")
+        st.warning("⚠️ Enter your Groq API key in the sidebar. Free at console.groq.com")
         st.stop()
 
     st.session_state.messages.append({"role": "user", "content": active})
@@ -202,12 +184,9 @@ if active:
         try:
             rows, sql, answer = run_question(active, api_key)
         except Exception as e:
-            rows, sql, answer = [], "", f"Something went wrong: {e}"
+            rows, sql, answer = [], "", f"Error: {e}"
 
     st.session_state.messages.append({
-        "role": "bot",
-        "answer": answer,
-        "sql": sql,
-        "rows": rows or []
+        "role": "bot", "answer": answer, "sql": sql, "rows": rows or []
     })
     st.rerun()
